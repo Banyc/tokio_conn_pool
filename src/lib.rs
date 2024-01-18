@@ -14,15 +14,29 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[async_trait]
 pub trait Connect: Sync + Send {
-    type Key;
     type Connection;
-    async fn connect(&self, key: &Self::Key) -> Option<Self::Connection>;
+    async fn connect(&self) -> Option<Self::Connection>;
 }
 
 #[async_trait]
 pub trait Heartbeat: Sync + Send {
     type Connection;
     async fn heartbeat(&self, conn: Self::Connection) -> Option<Self::Connection>;
+}
+
+pub struct ConnPoolEntry<K, T> {
+    pub key: K,
+    pub connect: Arc<dyn Connect<Connection = T>>,
+    pub heartbeat: Arc<dyn Heartbeat<Connection = T>>,
+}
+impl<K: Clone, T> Clone for ConnPoolEntry<K, T> {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            connect: Arc::clone(&self.connect),
+            heartbeat: Arc::clone(&self.heartbeat),
+        }
+    }
 }
 
 pub struct ConnPool<K, T> {
@@ -38,12 +52,9 @@ where
         }
     }
 
-    pub fn new(
-        key_connect_pairs: impl Iterator<Item = (K, Arc<dyn Connect<Key = K, Connection = T>>)>,
-        heartbeat: Arc<dyn Heartbeat<Connection = T>>,
-    ) -> Self {
+    pub fn new(entries: impl Iterator<Item = ConnPoolEntry<K, T>>) -> Self {
         Self {
-            pool: Arc::new(Arc::new(PoolInner::new(key_connect_pairs, heartbeat)).into()),
+            pool: Arc::new(Arc::new(PoolInner::new(entries)).into()),
         }
     }
 
@@ -76,17 +87,15 @@ where
         }
     }
 
-    pub fn new(
-        key_connect_pairs: impl Iterator<Item = (K, Arc<dyn Connect<Key = K, Connection = T>>)>,
-        heartbeat: Arc<dyn Heartbeat<Connection = T>>,
-    ) -> Self {
+    pub fn new(entries: impl Iterator<Item = ConnPoolEntry<K, T>>) -> Self {
         let mut queues = HashMap::new();
-        key_connect_pairs.for_each(|(k, c)| {
-            let mut queue = ConnQueue::new(k.clone(), c, Arc::clone(&heartbeat));
+        entries.for_each(|e| {
+            let key = e.key.clone();
+            let mut queue = ConnQueue::new(e);
             for _ in 0..QUEUE_LEN {
                 queue.spawn_insert(HEARTBEAT_INTERVAL);
             }
-            queues.insert(k, Mutex::new(queue));
+            queues.insert(key, Mutex::new(queue));
         });
 
         Self { queues }
@@ -104,38 +113,28 @@ where
 struct ConnQueue<K, T> {
     queue: Arc<RwLock<VecDeque<ConnCell<T>>>>,
     connect_tasks: JoinSet<()>,
-    key: K,
-    connect: Arc<dyn Connect<Key = K, Connection = T>>,
-    heartbeat: Arc<dyn Heartbeat<Connection = T>>,
+    entry: ConnPoolEntry<K, T>,
 }
 
 impl<K: Send + Clone + 'static, T: Send + Sync + 'static> ConnQueue<K, T> {
-    pub fn new(
-        key: K,
-        connect: Arc<dyn Connect<Key = K, Connection = T>>,
-        heartbeat: Arc<dyn Heartbeat<Connection = T>>,
-    ) -> Self {
+    pub fn new(entry: ConnPoolEntry<K, T>) -> Self {
         Self {
             queue: Default::default(),
             connect_tasks: Default::default(),
-            key,
-            connect,
-            heartbeat,
+            entry,
         }
     }
 
     pub fn spawn_insert(&mut self, heartbeat_interval: Duration) {
         let queue = self.queue.clone();
-        let connect = Arc::clone(&self.connect);
-        let heartbeat = Arc::clone(&self.heartbeat);
-        let key = self.key.clone();
+        let entry = self.entry.clone();
         self.connect_tasks.spawn(async move {
             loop {
-                let Some(conn) = connect.connect(&key).await else {
+                let Some(conn) = entry.connect.connect().await else {
                     tokio::time::sleep(RETRY_INTERVAL).await;
                     continue;
                 };
-                let cell = ConnCell::create(conn, Arc::clone(&heartbeat), heartbeat_interval);
+                let cell = ConnCell::create(conn, Arc::clone(&entry.heartbeat), heartbeat_interval);
                 let mut queue = queue.write().unwrap();
                 queue.push_back(cell);
                 break;
@@ -270,15 +269,17 @@ mod tests {
         addr
     }
 
-    struct TcpConnect;
+    struct TcpConnect {
+        pub addr: SocketAddr,
+    }
     #[async_trait]
     impl Connect for TcpConnect {
-        type Key = SocketAddr;
         type Connection = TcpStream;
-        async fn connect(&self, key: &Self::Key) -> Option<Self::Connection> {
-            TcpStream::connect(*key).await.ok()
+        async fn connect(&self) -> Option<Self::Connection> {
+            TcpStream::connect(self.addr).await.ok()
         }
     }
+
     struct TcpHeartbeat;
     #[async_trait]
     impl Heartbeat for TcpHeartbeat {
@@ -291,9 +292,12 @@ mod tests {
     #[tokio::test]
     async fn take_none() {
         let addr = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
-        let connect = Arc::new(TcpConnect) as Arc<dyn Connect<Key = _, Connection = _>>;
-        let connect = [(addr, connect)];
-        let pool = ConnPool::new(connect.into_iter(), Arc::new(TcpHeartbeat));
+        let entry = ConnPoolEntry {
+            key: addr,
+            connect: Arc::new(TcpConnect { addr }) as Arc<dyn Connect<Connection = _>>,
+            heartbeat: Arc::new(TcpHeartbeat),
+        };
+        let pool = ConnPool::new([entry].into_iter());
         let mut join_set = JoinSet::new();
         for _ in 0..100 {
             let pool = pool.clone();
@@ -307,9 +311,12 @@ mod tests {
     #[tokio::test]
     async fn take_some() {
         let addr = spawn_listener().await;
-        let connect = Arc::new(TcpConnect) as Arc<dyn Connect<Key = _, Connection = _>>;
-        let connect = [(addr, connect)];
-        let pool = ConnPool::new(connect.into_iter(), Arc::new(TcpHeartbeat));
+        let entry = ConnPoolEntry {
+            key: addr,
+            connect: Arc::new(TcpConnect { addr }) as Arc<dyn Connect<Connection = _>>,
+            heartbeat: Arc::new(TcpHeartbeat),
+        };
+        let pool = ConnPool::new([entry].into_iter());
         for _ in 0..10 {
             tokio::time::sleep(Duration::from_millis(500)).await;
             for _ in 0..QUEUE_LEN {
