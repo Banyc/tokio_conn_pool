@@ -14,3 +14,4 @@ tokio = { version = "1", features = [] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+swap = { git = "https://github.com/Banyc/swap.git", rev = "d10a8b5b10503fa6ebac523cfcaa4d62135a665f" }

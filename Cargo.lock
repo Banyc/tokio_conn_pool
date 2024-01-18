@@ -261,6 +261,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "swap"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/swap.git?rev=d10a8b5b10503fa6ebac523cfcaa4d62135a665f#d10a8b5b10503fa6ebac523cfcaa4d62135a665f"
+dependencies = [
+ "arc-swap",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -309,6 +317,7 @@ dependencies = [
  "async-trait",
  "futures-core",
  "noop-waker",
+ "swap",
  "tokio",
 ]
 

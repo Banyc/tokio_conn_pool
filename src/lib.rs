@@ -4,7 +4,6 @@ use std::{
     time::Duration,
 };
 
-use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tokio::{sync::RwLock as TokioRwLock, task::JoinSet};
 
@@ -42,45 +41,9 @@ impl<K: Clone, T> Clone for ConnPoolEntry<K, T> {
 
 #[derive(Debug)]
 pub struct ConnPool<K, T> {
-    pool: Arc<ArcSwap<PoolInner<K, T>>>,
-}
-impl<K, T: Send + Sync + 'static> ConnPool<K, T>
-where
-    K: std::hash::Hash + Eq + Clone + Send + 'static,
-{
-    pub fn empty() -> Self {
-        Self {
-            pool: Arc::new(Arc::new(PoolInner::empty()).into()),
-        }
-    }
-
-    pub fn new(entries: impl Iterator<Item = ConnPoolEntry<K, T>>) -> Self {
-        Self {
-            pool: Arc::new(Arc::new(PoolInner::new(entries)).into()),
-        }
-    }
-
-    pub fn pull(&self, key: &K) -> Option<T> {
-        self.pool.load().pull(key)
-    }
-
-    pub fn replaced_by(&self, new: Self) {
-        self.pool.store(new.pool.load_full());
-    }
-}
-impl<K, T> Clone for ConnPool<K, T> {
-    fn clone(&self) -> Self {
-        Self {
-            pool: Arc::clone(&self.pool),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct PoolInner<K, T> {
     queues: HashMap<K, Mutex<ConnQueue<K, T>>>,
 }
-impl<K, T: Send + Sync + 'static> PoolInner<K, T>
+impl<K, T: Send + Sync + 'static> ConnPool<K, T>
 where
     K: std::hash::Hash + Eq + Clone + Send + 'static,
 {
@@ -247,6 +210,7 @@ enum TryTake<T> {
 mod tests {
     use std::net::SocketAddr;
 
+    use swap::Swap;
     use tokio::{
         io::AsyncReadExt,
         net::{TcpListener, TcpStream},
@@ -301,15 +265,15 @@ mod tests {
         let addr = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
         let entry = ConnPoolEntry {
             key: addr,
-            connect: Arc::new(TcpConnect { addr }) as Arc<dyn Connect<Connection = _>>,
+            connect: Arc::new(TcpConnect { addr }),
             heartbeat: Arc::new(TcpHeartbeat),
         };
-        let pool = ConnPool::new([entry].into_iter());
+        let pool = Swap::new(ConnPool::new([entry].into_iter()));
         let mut join_set = JoinSet::new();
         for _ in 0..100 {
             let pool = pool.clone();
             join_set.spawn(async move {
-                let res = pool.pull(&addr);
+                let res = pool.inner().pull(&addr);
                 assert!(res.is_none());
             });
         }
@@ -320,7 +284,7 @@ mod tests {
         let addr = spawn_listener().await;
         let entry = ConnPoolEntry {
             key: addr,
-            connect: Arc::new(TcpConnect { addr }) as Arc<dyn Connect<Connection = _>>,
+            connect: Arc::new(TcpConnect { addr }),
             heartbeat: Arc::new(TcpHeartbeat),
         };
         let pool = ConnPool::new([entry].into_iter());
