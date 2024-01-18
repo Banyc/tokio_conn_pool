@@ -13,17 +13,18 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[async_trait]
-pub trait Connect: Sync + Send {
+pub trait Connect: std::fmt::Debug + Sync + Send {
     type Connection;
     async fn connect(&self) -> Option<Self::Connection>;
 }
 
 #[async_trait]
-pub trait Heartbeat: Sync + Send {
+pub trait Heartbeat: std::fmt::Debug + Sync + Send {
     type Connection;
     async fn heartbeat(&self, conn: Self::Connection) -> Option<Self::Connection>;
 }
 
+#[derive(Debug)]
 pub struct ConnPoolEntry<K, T> {
     pub key: K,
     pub connect: Arc<dyn Connect<Connection = T>>,
@@ -39,6 +40,7 @@ impl<K: Clone, T> Clone for ConnPoolEntry<K, T> {
     }
 }
 
+#[derive(Debug)]
 pub struct ConnPool<K, T> {
     pool: Arc<ArcSwap<PoolInner<K, T>>>,
 }
@@ -74,6 +76,7 @@ impl<K, T> Clone for ConnPool<K, T> {
     }
 }
 
+#[derive(Debug)]
 struct PoolInner<K, T> {
     queues: HashMap<K, Mutex<ConnQueue<K, T>>>,
 }
@@ -110,6 +113,7 @@ where
     }
 }
 
+#[derive(Debug)]
 struct ConnQueue<K, T> {
     queue: Arc<RwLock<VecDeque<ConnCell<T>>>>,
     connect_tasks: JoinSet<()>,
@@ -184,6 +188,7 @@ impl<K: Send + Clone + 'static, T: Send + Sync + 'static> ConnQueue<K, T> {
     }
 }
 
+#[derive(Debug)]
 struct ConnCell<T> {
     cell: Arc<TokioRwLock<Option<T>>>,
     _heartbeat_task: JoinSet<()>,
@@ -269,6 +274,7 @@ mod tests {
         addr
     }
 
+    #[derive(Debug)]
     struct TcpConnect {
         pub addr: SocketAddr,
     }
@@ -280,6 +286,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct TcpHeartbeat;
     #[async_trait]
     impl Heartbeat for TcpHeartbeat {
