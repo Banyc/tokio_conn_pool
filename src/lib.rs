@@ -11,18 +11,79 @@ const QUEUE_LEN: usize = 16;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Connect and give the connection to the pool.
+///
+/// # Example
+///
+/// ```rust
+/// use std::net::SocketAddr;
+///
+/// use async_trait::async_trait;
+/// use tokio::net::TcpStream;
+/// use tokio_conn_pool::Connect;
+///
+/// #[derive(Debug)]
+/// struct TcpConnect {
+///     pub addr: SocketAddr,
+/// }
+/// #[async_trait]
+/// impl Connect for TcpConnect {
+///     type Connection = TcpStream;
+///     async fn connect(&self) -> Option<Self::Connection> {
+///         TcpStream::connect(self.addr).await.ok()
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait Connect: std::fmt::Debug + Sync + Send {
     type Connection;
+    /// Connect and give the connection to the pool.
     async fn connect(&self) -> Option<Self::Connection>;
 }
 
+/// Do anything necessary to keep this `conn` alive.
+///
+/// # Example
+///
+/// ```rust
+/// use std::{io, net::SocketAddr, time::Duration};
+///
+/// use async_trait::async_trait;
+/// use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
+/// use tokio_conn_pool::Heartbeat;
+///
+/// #[derive(Debug)]
+/// struct TcpHeartbeat;
+/// #[async_trait]
+/// impl Heartbeat for TcpHeartbeat {
+///     type Connection = TcpStream;
+///     async fn heartbeat(&self, mut conn: Self::Connection) -> Option<Self::Connection> {
+///         tokio::time::timeout(Duration::from_secs(1), async move {
+///             conn.write_all(b"ping").await?;
+///             let mut buf = [0; 4];
+///             conn.read_exact(&mut buf).await?;
+///             if &buf != b"pong" {
+///                 return Err(io::Error::new(
+///                     io::ErrorKind::InvalidData,
+///                     "peer sent the wrong pong",
+///                 ));
+///             }
+///             Ok::<Self::Connection, io::Error>(conn)
+///         })
+///         .await
+///         .ok()?
+///         .ok()
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait Heartbeat: std::fmt::Debug + Sync + Send {
     type Connection;
+    /// Do anything necessary to keep this `conn` alive.
     async fn heartbeat(&self, conn: Self::Connection) -> Option<Self::Connection>;
 }
 
+/// Store necessary information for the connection pool to maintain connections.
 #[derive(Debug)]
 pub struct ConnPoolEntry<K, T> {
     pub key: K,
@@ -39,6 +100,7 @@ impl<K: Clone, T> Clone for ConnPoolEntry<K, T> {
     }
 }
 
+/// The pool keeps a set of connections alive for each target.
 #[derive(Debug)]
 pub struct ConnPool<K, T> {
     queues: HashMap<K, Mutex<ConnQueue<K, T>>>,
@@ -53,6 +115,16 @@ where
         }
     }
 
+    /// # Example
+    ///
+    /// ```ignore
+    /// let entry = ConnPoolEntry {
+    ///     key: addr,
+    ///     connect: Arc::new(TcpConnect { addr }),
+    ///     heartbeat: Arc::new(TcpHeartbeat),
+    /// };
+    /// let pool = ConnPool::new([entry].into_iter());
+    /// ```
     pub fn new(entries: impl Iterator<Item = ConnPoolEntry<K, T>>) -> Self {
         let mut queues = HashMap::new();
         entries.for_each(|e| {
@@ -67,6 +139,7 @@ where
         Self { queues }
     }
 
+    /// Pull a connection as fast as possible. It gives up and returns [`None`] if the pulling requires any sort of waiting.
     pub fn pull(&self, key: &K) -> Option<T> {
         let mut queue = match self.queues.get(key).and_then(|queue| queue.try_lock().ok()) {
             Some(queue) => queue,
@@ -96,16 +169,15 @@ impl<K: Send + Clone + 'static, T: Send + Sync + 'static> ConnQueue<K, T> {
         let queue = self.queue.clone();
         let entry = self.entry.clone();
         self.connect_tasks.spawn(async move {
-            loop {
-                let Some(conn) = entry.connect.connect().await else {
-                    tokio::time::sleep(RETRY_INTERVAL).await;
-                    continue;
+            let conn = loop {
+                if let Some(conn) = entry.connect.connect().await {
+                    break conn;
                 };
-                let cell = ConnCell::create(conn, Arc::clone(&entry.heartbeat), heartbeat_interval);
-                let mut queue = queue.write().unwrap();
-                queue.push_back(cell);
-                break;
-            }
+                tokio::time::sleep(RETRY_INTERVAL).await;
+            };
+            let cell = ConnCell::create(conn, Arc::clone(&entry.heartbeat), heartbeat_interval);
+            let mut queue = queue.write().unwrap();
+            queue.push_back(cell);
         });
     }
 
@@ -208,11 +280,11 @@ enum TryTake<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{io, net::SocketAddr};
 
     use swap::Swap;
     use tokio::{
-        io::AsyncReadExt,
+        io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
         task::JoinSet,
     };
@@ -226,11 +298,15 @@ mod tests {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 tokio::spawn(async move {
-                    let mut buf = [0; 1024];
+                    let mut buf = [0; 4];
                     loop {
                         if let Err(_e) = stream.read_exact(&mut buf).await {
                             break;
                         }
+                        if &buf != b"ping" {
+                            panic!();
+                        }
+                        stream.write_all(b"pong").await.unwrap();
                     }
                 });
             }
@@ -255,8 +331,22 @@ mod tests {
     #[async_trait]
     impl Heartbeat for TcpHeartbeat {
         type Connection = TcpStream;
-        async fn heartbeat(&self, conn: Self::Connection) -> Option<Self::Connection> {
-            Some(conn)
+        async fn heartbeat(&self, mut conn: Self::Connection) -> Option<Self::Connection> {
+            tokio::time::timeout(Duration::from_secs(1), async move {
+                conn.write_all(b"ping").await?;
+                let mut buf = [0; 4];
+                conn.read_exact(&mut buf).await?;
+                if &buf != b"pong" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "peer sent the wrong pong",
+                    ));
+                }
+                Ok::<Self::Connection, io::Error>(conn)
+            })
+            .await
+            .ok()?
+            .ok()
         }
     }
 
@@ -294,6 +384,22 @@ mod tests {
                 let res = pool.pull(&addr);
                 assert!(res.is_some());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat() {
+        let addr = spawn_listener().await;
+        let entry = ConnPoolEntry {
+            key: addr,
+            connect: Arc::new(TcpConnect { addr }),
+            heartbeat: Arc::new(TcpHeartbeat),
+        };
+        let pool = ConnPool::new([entry].into_iter());
+        tokio::time::sleep(Duration::from_secs(1) + HEARTBEAT_INTERVAL).await;
+        for _ in 0..QUEUE_LEN {
+            let res = pool.pull(&addr);
+            assert!(res.is_some());
         }
     }
 }
