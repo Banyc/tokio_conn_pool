@@ -204,15 +204,19 @@ impl<K: Send + Clone + 'static, T: Send + Sync + 'static> ConnQueue<K, T> {
         };
 
         // Remove the completed task to avoid memory leak
-        {
+        loop {
             let waker = noop_waker::noop_waker();
             let mut cx = std::task::Context::from_waker(&waker);
             let ready = self.connect_tasks.poll_join_next(&mut cx);
             let ready = match ready {
                 std::task::Poll::Ready(r) => r,
-                std::task::Poll::Pending => panic!(),
+                std::task::Poll::Pending => {
+                    // `JoinSet` coop budget is reached
+                    continue;
+                }
             };
             ready.unwrap().expect("Pool task panicked");
+            break;
         }
 
         // Replenish
